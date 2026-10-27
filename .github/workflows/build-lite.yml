@@ -36,6 +36,15 @@ jobs:
           echo "Using $NDK"
           "$SDK" --channel=3 "$NDK" "platform-tools" "build-tools;35.0.1" "platforms;android-35"
           echo "ANDROID_NDK_VERSION=${NDK#ndk;}" >> "$GITHUB_ENV"
+            - name: LFS and submodules
+        run: |
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          git config --local credential.https://projects.blender.org.helper '!f() { echo username=; echo password=; }; f'
+          git lfs install --local
+          git lfs pull
+          git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64
+          git submodule update --init lib/android_arm64
+          df -h /
       - name: Vulkan headers
         run: |
           VER=1.4.341
