@@ -1,0 +1,94 @@
+name: build-engine
+on:
+  push:
+    branches: [android]
+    paths:
+      - 'build_files/android/android_features_engine.cmake'
+      - '.github/workflows/build-engine.yml'
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check engine config exists
+        run: test -f build_files/android/android_features_engine.cmake
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf zip unzip git-lfs bison flex gcc-14 g++-14 \
+            libx11-dev libxxf86vm-dev libxfixes-dev libxcursor-dev libxi-dev \
+            libxrandr-dev libxinerama-dev libegl-dev libgl-dev
+          cmake --version
+
+      - name: Android SDK and NDK
+        run: |
+          export ANDROID_HOME="$HOME/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fL -o /tmp/cmd.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmd.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          SDK="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDK" --licenses > /dev/null || true
+          NDK=$("$SDK" --list --channel=3 2>/dev/null | grep -o 'ndk;30[^ |]*' | sort -V | tail -1)
+          if [ -z "$NDK" ]; then echo "No NDK 30.x found in sdkmanager"; exit 1; fi
+          echo "Using $NDK"
+          "$SDK" --channel=3 "$NDK" "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+          echo "ANDROID_NDK_VERSION=${NDK#ndk;}" >> "$GITHUB_ENV"
+
+      - name: LFS and submodules
+        run: |
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          git config --local credential.https://projects.blender.org.helper '!f() { echo username=; echo password=; }; f'
+          git lfs install --local
+          git lfs pull
+          git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64
+          git submodule update --init lib/android_arm64
+          df -h /
+
+      - name: Vulkan headers
+        run: |
+          VER=1.4.341
+          curl -fL -o /tmp/vh.tar.gz https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v$VER.tar.gz
+          tar -xzf /tmp/vh.tar.gz -C /tmp
+          mkdir -p ../blender_build_android/lib/vulkan_headers
+          cp -R /tmp/Vulkan-Headers-$VER/include ../blender_build_android/lib/vulkan_headers/include
+
+      - name: Build engine APK
+        run: |
+          set -o pipefail
+          export ANDROID_HOME="$HOME/android-sdk"
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          build_files/android/build_apk.sh engine 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Last lines of log
+        if: failure()
+        run: |
+          echo "=== FAILED / error lines ==="
+          grep -n -m 30 -E "FAILED|CMake Error|error:|Error:|Unknown|usage|Usage" build.log || true
+          echo "=== last 150 lines ==="
+          tail -n 150 build.log
+
+      - name: Save full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Collect APK
+        run: cp ../blender_build_android/android_apk_stage_engine/blender-engine.apk .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blender-engine-apk
+          path: blender-engine.apk
