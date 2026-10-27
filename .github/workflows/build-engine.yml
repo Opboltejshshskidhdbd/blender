@@ -22,6 +22,16 @@ jobs:
       - name: Check engine config exists
         run: test -f build_files/android/android_features_engine.cmake
 
+      - name: Allow the engine config in the build scripts
+        run: |
+          sed -i 's/lite|full/lite|full|engine/g' build_files/android/build_apk.sh
+          for f in build_files/android/apk/package.sh build_files/android/build.py build_files/android/env.sh; do
+            [ -f "$f" ] && sed -i 's/lite|full/lite|full|engine/g' "$f" || true
+          done
+          echo "--- remaining places that mention lite/full in package.sh:"
+          grep -n "lite\|full" build_files/android/apk/package.sh || true
+          grep -n "usage" build_files/android/build_apk.sh
+
       - name: Install tools
         run: |
           sudo apt-get update
@@ -86,7 +96,9 @@ jobs:
           path: build.log
 
       - name: Collect APK
-        run: cp ../blender_build_android/android_apk_stage_engine/blender-engine.apk .
+        run: |
+          find ../blender_build_android -name '*.apk' -print
+          find ../blender_build_android/android_apk_stage_engine -name '*.apk' -exec cp {} blender-engine.apk \;
 
       - uses: actions/upload-artifact@v4
         with:
