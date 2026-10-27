@@ -27,18 +27,15 @@ jobs:
           curl -fL -o /tmp/cmd.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q /tmp/cmd.zip -d "$ANDROID_HOME/cmdline-tools"
           mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --channel=1 \
-            "ndk;30.0.14904198-beta1" "platform-tools" "build-tools;35.0.1" "platforms;android-35"
-      - name: LFS and submodules
-        run: |
-          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-          git config --local credential.https://projects.blender.org.helper '!f() { echo username=; echo password=; }; f'
-          git lfs install --local
-          git lfs pull
-          git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64
-          git submodule update --init lib/android_arm64
-          df -h /
+          SDK="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDK" --licenses > /dev/null || true
+          echo "--- NDK versions available:"
+          "$SDK" --list --channel=3 2>/dev/null | grep -o 'ndk;[0-9][^ |]*' | sort -uV
+          NDK=$("$SDK" --list --channel=3 2>/dev/null | grep -o 'ndk;30[^ |]*' | sort -V | tail -1)
+          if [ -z "$NDK" ]; then echo "No NDK 30.x found in sdkmanager"; exit 1; fi
+          echo "Using $NDK"
+          "$SDK" --channel=3 "$NDK" "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+          echo "ANDROID_NDK_VERSION=${NDK#ndk;}" >> "$GITHUB_ENV"
       - name: Vulkan headers
         run: |
           VER=1.4.341
