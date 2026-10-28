@@ -1,0 +1,194 @@
+name: build-engine-bundle
+on:
+  workflow_dispatch:
+  push:
+    branches: [android]
+    paths:
+      - 'build_files/android/android_features_engine.cmake'
+      - '.github/workflows/build-engine-bundle.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check engine config exists
+        run: test -f build_files/android/android_features_engine.cmake
+
+      - name: Allow the engine config in the build scripts
+        run: |
+          sed -i 's/lite|full/lite|full|engine/g' build_files/android/build_apk.sh
+          for f in build_files/android/apk/package.sh build_files/android/build.py build_files/android/env.sh; do
+            [ -f "$f" ] && sed -i 's/lite|full/lite|full|engine/g' "$f" || true
+          done
+
+      - name: Patch BlenderActivity for headless engine mode
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("build_files/android/apk/app/src/main/java/org/blender/blender/BlenderActivity.java")
+          s = p.read_text()
+          a1 = "  @Override\n  protected void onCreate(Bundle state) {\n"
+          assert s.count(a1) == 1, "onCreate anchor not found exactly once"
+          helper = (
+              "  /* Engine mode: EngineActivity subclasses this class. It runs Blender in\n"
+              "   * background mode with no UI, so it must not open Settings, go immersive\n"
+              "   * or add the soft-keyboard view. */\n"
+              "  private boolean isHeadless() {\n"
+              "    return getClass() != BlenderActivity.class;\n"
+              "  }\n\n"
+          )
+          s = s.replace(a1, helper + a1, 1)
+          a2 = "    super.onCreate(state);\n    announceLogPath();\n"
+          assert s.count(a2) == 1, "super.onCreate anchor not found exactly once"
+          s = s.replace(a2, "    super.onCreate(state);\n    if (isHeadless()) {\n      return;\n    }\n    announceLogPath();\n", 1)
+          p.write_text(s)
+          print("patched", p)
+          PY
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf zip unzip git-lfs bison flex gcc-14 g++-14 \
+            libx11-dev libxxf86vm-dev libxfixes-dev libxcursor-dev libxi-dev \
+            libxrandr-dev libxinerama-dev libegl-dev libgl-dev
+          cmake --version
+
+      - name: Android SDK and NDK
+        run: |
+          export ANDROID_HOME="$HOME/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fL -o /tmp/cmd.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmd.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          SDK="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDK" --licenses > /dev/null || true
+          NDK=$("$SDK" --list --channel=3 2>/dev/null | grep -o 'ndk;30[^ |]*' | sort -V | tail -1)
+          if [ -z "$NDK" ]; then echo "No NDK 30.x found in sdkmanager"; exit 1; fi
+          echo "Using $NDK"
+          "$SDK" --channel=3 "$NDK" "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+          echo "ANDROID_NDK_VERSION=${NDK#ndk;}" >> "$GITHUB_ENV"
+
+      - name: LFS and submodules
+        run: |
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          git config --local credential.https://projects.blender.org.helper '!f() { echo username=; echo password=; }; f'
+          git lfs install --local
+          git lfs pull
+          git -c submodule.lib/linux_x64.update=checkout submodule update --init lib/linux_x64
+          git submodule update --init lib/android_arm64
+          df -h /
+
+      - name: Vulkan headers
+        run: |
+          VER=1.4.341
+          curl -fL -o /tmp/vh.tar.gz https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v$VER.tar.gz
+          tar -xzf /tmp/vh.tar.gz -C /tmp
+          mkdir -p ../blender_build_android/lib/vulkan_headers
+          cp -R /tmp/Vulkan-Headers-$VER/include ../blender_build_android/lib/vulkan_headers/include
+
+      - name: Build engine
+        run: |
+          set -o pipefail
+          export ANDROID_HOME="$HOME/android-sdk"
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          build_files/android/build_apk.sh engine 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Last lines of log
+        if: failure()
+        run: |
+          echo "=== FAILED / error lines ==="
+          grep -n -m 30 -E "FAILED|CMake Error|error:|Error:|Unknown|usage|Usage" build.log || true
+          echo "=== last 150 lines ==="
+          tail -n 150 build.log
+
+      - name: Save full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Size report (before trimming)
+        run: |
+          STAGE="$GITHUB_WORKSPACE/../blender_build_android/android_apk_stage_engine"
+          echo "--- native libs total"; du -sh "$STAGE/lib/arm64-v8a"
+          echo "--- 15 biggest native libs"; ls -S -l "$STAGE/lib/arm64-v8a" | head -16
+          mkdir -p /tmp/rt
+          unzip -q "$STAGE/assets/blender_runtime.zip" -d /tmp/rt
+          echo "--- runtime payload top level"; du -sh /tmp/rt/* | sort -h
+          echo "--- datafiles"; du -sh /tmp/rt/datafiles/* | sort -h
+          echo "--- python lib"; du -sh /tmp/rt/python/lib/python3.13/* | sort -h | tail -15
+
+      - name: Trim runtime (safe removals only)
+        run: |
+          cd /tmp/rt
+          rm -rf datafiles/locale
+          PYLIB=python/lib/python3.13
+          rm -rf "$PYLIB/test" "$PYLIB/idlelib" "$PYLIB/tkinter" "$PYLIB/turtledemo" "$PYLIB/lib2to3" "$PYLIB/pydoc_data"
+          find "$PYLIB/site-packages" -type d -name tests -prune -exec rm -rf {} + 2>/dev/null || true
+          find . -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          echo "--- runtime payload after trimming"; du -sh /tmp/rt; du -sh /tmp/rt/* | sort -h
+
+      - name: Assemble engine bundle
+        run: |
+          STAGE="$GITHUB_WORKSPACE/../blender_build_android/android_apk_stage_engine"
+          B="$GITHUB_WORKSPACE/bundle"
+          mkdir -p "$B/lib" "$B/assets" "$B/java/org/blender/blender"
+          cp -R "$STAGE/lib/arm64-v8a" "$B/lib/"
+          (cd /tmp/rt && zip -qr -X "$B/assets/blender_runtime.zip" .)
+          cp build_files/android/apk/app/src/main/java/org/blender/blender/BlenderActivity.java "$B/java/org/blender/blender/"
+          cat > "$B/java/org/blender/blender/EngineActivity.java" <<'EOF'
+          package org.blender.blender;
+
+          /* Headless Blender engine. Started with blender_args.txt holding
+           * "-b --python <script>"; BlenderActivity skips all UI for subclasses. */
+          public class EngineActivity extends BlenderActivity {
+          }
+          EOF
+          cat > "$B/MANIFEST_SNIPPET.xml" <<'EOF'
+          <!-- application: android:extractNativeLibs="true" android:largeHeap="true" -->
+          <uses-feature android:name="android.hardware.vulkan.version"
+              android:version="0x400000" android:required="false" />
+          <activity
+              android:name="org.blender.blender.EngineActivity"
+              android:process=":engine"
+              android:exported="false"
+              android:launchMode="singleTask"
+              android:excludeFromRecents="true"
+              android:theme="@android:style/Theme.Translucent.NoTitleBar"
+              android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|density|navigation|uiMode">
+              <meta-data android:name="android.app.lib_name" android:value="blender" />
+          </activity>
+          EOF
+
+      - name: Compile check of the Java sources
+        run: |
+          B="$GITHUB_WORKSPACE/bundle"
+          ANDROID_JAR="$HOME/android-sdk/platforms/android-35/android.jar"
+          mkdir -p /tmp/jc
+          "$JAVA_HOME_17_X64/bin/javac" -classpath "$ANDROID_JAR" -source 17 -target 17 -d /tmp/jc \
+            "$B/java/org/blender/blender/BlenderActivity.java" "$B/java/org/blender/blender/EngineActivity.java"
+          echo "Java compile OK"
+          (cd "$B" && zip -qr -X "$GITHUB_WORKSPACE/engine-bundle.zip" .)
+          ls -lh "$GITHUB_WORKSPACE/engine-bundle.zip"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete engine-1 --yes --cleanup-tag || true
+          gh release create engine-1 engine-bundle.zip \
+            --target "$GITHUB_SHA" \
+            --title "Engine bundle 1" \
+            --notes "Headless Blender engine bundle (arm64): native libs, runtime zip, patched Java sources, manifest snippet."
