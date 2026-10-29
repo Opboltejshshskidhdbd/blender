@@ -1,0 +1,89 @@
+name: slim-engine-bundle
+on:
+  workflow_dispatch:
+  push:
+    branches: [android]
+    paths:
+      - '.github/workflows/slim-engine-bundle.yml'
+permissions:
+  contents: write
+jobs:
+  slim:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download engine-1 bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download engine-1 --repo "$GITHUB_REPOSITORY" --pattern engine-bundle.zip --dir .
+          mkdir work
+          unzip -q engine-bundle.zip -d work
+          du -sh work engine-bundle.zip
+
+      - name: Slim the bundle
+        run: |
+          cat > slim_bundle.py <<'PY'
+          import collections, os, re, shutil, subprocess, sys, zipfile
+
+          bundle = sys.argv[1]
+          libdir = os.path.join(bundle, "lib", "arm64-v8a")
+          libs = [f for f in os.listdir(libdir) if f.endswith(".so")]
+
+          def needed(path):
+              out = subprocess.run(["readelf", "-d", path], capture_output=True, text=True).stdout
+              return re.findall(r"Shared library: \[(.*?)\]", out)
+
+          deps = {f: needed(os.path.join(libdir, f)) for f in libs}
+          roots = ["libblender.so", "libpython3_13_bin.so", "libc++_shared.so"]
+          roots += [f for f in libs if "cpython-313-aarch64-linux-android" in f]
+          if "libblender.so" not in deps:
+              sys.exit("libblender.so missing, refusing to slim")
+          seen, queue = set(), collections.deque(r for r in roots if r in deps)
+          while queue:
+              f = queue.popleft()
+              if f in seen:
+                  continue
+              seen.add(f)
+              queue.extend(d for d in deps[f] if d in deps)
+
+          removed = [f for f in libs if f not in seen]
+          saved = 0
+          for f in removed:
+              p = os.path.join(libdir, f)
+              saved += os.path.getsize(p)
+              os.remove(p)
+              print("removed lib:", f)
+          print("native libs: kept %d, removed %d (%.1f MB)" % (len(seen), len(removed), saved / 1048576))
+
+          rt_zip = os.path.join(bundle, "assets", "blender_runtime.zip")
+          tmp = rt_zip + ".dir"
+          shutil.rmtree(tmp, ignore_errors=True)
+          with zipfile.ZipFile(rt_zip) as z:
+              z.extractall(tmp)
+          sp = os.path.join(tmp, "python", "lib", "python3.13", "site-packages")
+          for name in ("pxr", "MaterialX", "OpenImageIO", "PyOpenColorIO", "oslquery"):
+              shutil.rmtree(os.path.join(sp, name), ignore_errors=True)
+          os.remove(rt_zip)
+          with zipfile.ZipFile(rt_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for root, _, files in os.walk(tmp):
+                  for fn in files:
+                      full = os.path.join(root, fn)
+                      z.write(full, os.path.relpath(full, tmp))
+          shutil.rmtree(tmp)
+          print("runtime zip: %.1f MB" % (os.path.getsize(rt_zip) / 1048576))
+          PY
+          python3 slim_bundle.py work
+          (cd work && zip -qr -X ../engine-bundle-slim.zip .)
+          ls -lh engine-bundle.zip engine-bundle-slim.zip
+
+      - name: Publish release engine-2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mv engine-bundle-slim.zip engine-bundle.zip
+          gh release delete engine-2 --yes --cleanup-tag || true
+          gh release create engine-2 engine-bundle.zip \
+            --target "$GITHUB_SHA" \
+            --title "Engine bundle 2 (slim)" \
+            --notes "Same engine as engine-1 without the unused USD, MaterialX, OSL and OIIO/OCIO Python bindings."
